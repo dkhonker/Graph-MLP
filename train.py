@@ -9,7 +9,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-from models import GMLP
+from models import GCN
+from models1 import GMLP
 from utils import load_citation, accuracy, get_A_r
 import warnings
 warnings.filterwarnings('ignore')
@@ -38,21 +39,40 @@ parser.add_argument('--order', type=int, default=2,
                     help='to compute order-th power of adj')
 parser.add_argument('--tau', type=float, default=1.0,
                     help='temperature for Ncontrast loss')
+parser.add_argument('--no_train_adj', action='store_true', default=False,
+                    help='train using adj')
+parser.add_argument('--type', type=int, default=1,
+                    help='0=GMLP,1=GCN')
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
+Laf=False
+
 ## get data
 adj, features, labels, idx_train, idx_val, idx_test = load_citation(args.data, 'AugNormAdj', True)
+features_tmp = features.clone()
+if Laf==True:
+    v = torch.ones((features.shape[0], 1)).cuda() 
+    features= torch.cat((features,v,F.one_hot(labels)), dim=1)
+    features[idx_val][features_tmp.shape[1]:]=0
+    features[idx_test][features_tmp.shape[1]:]=0
 adj_label = get_A_r(adj, args.order)
 
 
 ## Model and optimizer
-model = GMLP(nfeat=features.shape[1],
+if args.type==1:
+    model = GCN(nfeat=features.shape[1],
             nhid=args.hidden,
             nclass=labels.max().item() + 1,
             dropout=args.dropout,
             )
+elif args.type==0:
+    model = GMLP(nfeat=features.shape[1],
+                nhid=args.hidden,
+                nclass=labels.max().item() + 1,
+                dropout=args.dropout,
+                )
 optimizer = optim.Adam(model.parameters(),
                        lr=args.lr, weight_decay=args.weight_decay)
 
@@ -80,17 +100,20 @@ def get_batch(batch_size):
     """
     get a batch of feature & adjacency matrix
     """
-    rand_indx = torch.tensor(np.random.choice(np.arange(adj_label.shape[0]), batch_size)).type(torch.long).cuda()
+    rand_indx = torch.tensor(np.random.choice(np.arange(adj_label.shape[0]), batch_size)).type(torch.long)#.cuda()
     rand_indx[0:len(idx_train)] = idx_train
     features_batch = features[rand_indx]
+    if Laf==True:
+        features_batch[:,features_tmp.shape[1]:]=0#LaF
     adj_label_batch = adj_label[rand_indx,:][:,rand_indx]
-    return features_batch, adj_label_batch
+    adj_batch = (adj.to_dense())[rand_indx,:][:,rand_indx]
+    return features_batch, adj_label_batch, adj_batch
 
 def train():
-    features_batch, adj_label_batch = get_batch(batch_size=args.batch_size)
+    features_batch, adj_label_batch, adj_batch = get_batch(batch_size=args.batch_size)
     model.train()
     optimizer.zero_grad()
-    output, x_dis = model(features_batch)
+    output, x_dis = model(features_batch,adj_batch,args.no_train_adj)
     loss_train_class = F.nll_loss(output[idx_train], labels[idx_train])
     loss_Ncontrast = Ncontrast(x_dis, adj_label_batch, tau = args.tau)
     loss_train = loss_train_class + loss_Ncontrast * args.alpha
@@ -101,7 +124,15 @@ def train():
 
 def test():
     model.eval()
-    output = model(features)
+    output = model(features,adj.to_dense())
+    loss_test = F.nll_loss(output[idx_test], labels[idx_test])
+    acc_test = accuracy(output[idx_test], labels[idx_test])
+    acc_val = accuracy(output[idx_val], labels[idx_val])
+    return acc_test, acc_val
+
+def test_wadj():
+    model.eval()
+    output = model(features,adj.to_dense(),False)
     loss_test = F.nll_loss(output[idx_test], labels[idx_test])
     acc_test = accuracy(output[idx_test], labels[idx_test])
     acc_val = accuracy(output[idx_val], labels[idx_val])
@@ -109,6 +140,7 @@ def test():
 
 best_accu = 0
 best_val_acc = 0
+best_val_acc_wadj = 0
 print('\n'+'training configs', args)
 for epoch in tqdm(range(args.epochs)):
     train()
@@ -116,6 +148,10 @@ for epoch in tqdm(range(args.epochs)):
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         test_acc = tmp_test_acc
+    tmp_test_acc_wadj, val_acc_wadj = test_wadj()
+    if val_acc_wadj > best_val_acc_wadj:
+        best_val_acc_wadj = val_acc_wadj
+        test_acc_wadj = tmp_test_acc_wadj
 
 
 log_file = open(r"log.txt", encoding="utf-8",mode="a+")  
@@ -131,4 +167,7 @@ with log_file as file_to_be_write:
                  args.weight_decay, args.data, \
                      test_acc.item(), file=file_to_be_write, sep=',')
 
-
+print(test_acc)
+print(test_acc_wadj)
+print(test())
+print(test_wadj())
